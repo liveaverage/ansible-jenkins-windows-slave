@@ -1,0 +1,86 @@
+---
+# tasks file for ansible-init-openshift-jenkins
+
+- name: Create project
+  shell: |
+    oc project default
+    oc new-project jenkins-{{ requestor }} \
+      --description='Created using Ansible for user {{ requestor }}' \
+      --display-name='Jenkins Pipeline - {{ requestor }}'
+  delegate_to: "{{ oc_master }}"
+  register: result_project
+  ignore_errors: true
+#  oc:
+#    state: present
+#    inline:
+#      kind: ProjectRequest
+#      metadata:
+#        name: "jenkins-{{ requestor }}"
+#      displayName: "{{ requestor }} - Jenkins Project"
+#      description: "This project was created using Ansible for user {{ requestor }}"
+#    token: "{{ oc_token }}"
+#  delegate_to: "{{ oc_master }}"
+
+- name: Create user
+  shell: |
+    oc create user {{ requestor }} --full-name="{{ requestor_name | default(requestor) }}"
+  delegate_to: "{{ oc_master }}"
+  ignore_errors: true
+
+- name: Add project role Admin to a user
+  shell: |
+    oc policy add-role-to-user admin {{ requestor }} -n jenkins-{{ requestor }}
+  delegate_to: "{{ oc_master }}"
+
+#  oc:
+#    state: present
+#    inline:
+#      kind: RoleBinding
+#      metadata:
+#        name: admin
+#        namespace: "jenkins-{{ requestor }}"
+#      roleRef:
+#        name: admin
+#      userNames:
+#        - "{{ requestor }}"
+#    token: "{{ oc_token }}"
+#  delegate_to: "{{ oc_master }}"
+
+- name: Get Bitbucket Repo details
+  uri:
+    url: "{{ bb_uri }}/rest/api/1.0/projects/{{ bb_user[:5] | upper }}/repos/{{ bb_project }}"
+    user: administrator
+    password: "{{ vc_password }}"
+    method: GET
+    force_basic_auth: yes
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body: |
+      {
+       "name": "{{ bb_project }}",
+       "scmId": "git",
+       "forkable": true,
+       "public": true
+      }
+    status_code:
+      - 200
+  register: repoget
+  changed_when: False
+
+- name: Display HTTP Clone URL
+  debug:
+    msg: "{{ repoget | json_query('json.links.clone[?name==`http`].href') | join ('') }}"
+
+- name: Set source repository
+  set_fact:
+    source_repo: "{{ repoget | json_query('json.links.clone[?name==`http`].href') | join ('') }}"
+
+- name: Initialize application from pipeline template
+  shell: |
+    oc new-app -f https://raw.githubusercontent.com/openshift/origin/master/examples/jenkins/pipeline/samplepipeline.yaml \
+      --param SOURCE_REPOSITORY_URL={{ source_repo }} \
+      --param GENERIC_WEBHOOK_SECRET={{ requestor }} \
+      -n jenkins-{{ requestor }}
+  delegate_to: "{{ oc_master }}"
+  ignore_errors: true
