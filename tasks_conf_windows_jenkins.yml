@@ -1,0 +1,137 @@
+---
+- name: Install Jenkins and deps
+  win_chocolatey:
+    name: "{{ item }}"
+    state: present
+  with_items:
+    - curl
+    - jre8
+    - jenkins
+
+- name: Scrape the temp admin pass from Jenkins
+  slurp:
+    src:  C:\Program Files (x86)\Jenkins\secrets\initialAdminPassword
+  no_log: true
+  register: jenkins_pass
+
+- debug:
+    msg: "{{ inventory_hostname }} - {{ jenkins_pass['content'] | b64decode | trim }}"
+
+- name: Wait for host Jenkins to be ready
+  wait_for:
+    port: 8080
+    timeout: 900
+    host: "{{ inventory_hostname }}"
+  delegate_to: 127.0.0.1
+
+- name: Download the jenkins slave cli jar
+  get_url:
+    url: "http://{{ inventory_hostname }}:8080/jnlpJars/jenkins-cli.jar"
+    dest: "{{ jenkins_jar }}"
+  delegate_to: 127.0.0.1
+
+- name: Install Jenkins plugins
+  shell:  "java -jar {{ jenkins_jar }} -auth admin:{{ jenkins_pass['content'] | b64decode | trim }} -s http://{{ inventory_hostname }}:8080/ install-plugin {{ item }}"
+  with_items: "{{ jenkins_plugins }}"
+  delegate_to: 127.0.0.1
+
+- name: Obtain assigned Jenkins JNLP NodePort
+  shell: |
+    oc describe svc jenkins-jnlp-np -n {{ ocp_p }} | grep NodePort | grep TCP | awk '{print $3}' | cut -d '/' -f 1
+  delegate_to: "{{ ocp_m }}"
+  register: ocp_np
+  ignore_errors: true
+  remote_user: root
+
+- name: Get Jenkins route
+  shell: "oc get route jenkins {% raw %}--template='{{ .spec.host }}'{% endraw %} -n {{ ocp_p }}"
+  register: ocp_route
+  delegate_to: "{{ ocp_m }}"
+
+- name: Get Jenkins token
+  shell: "oc serviceaccounts get-token jenkins -n {{ ocp_p }}"
+  register: ocp_token
+  delegate_to: "{{ ocp_m }}"
+
+- name: Check if Windows Slave is already present
+  uri:
+    url: "https://{{ ocp_route.stdout }}/computer/{{ inventory_hostname }}/api/json"
+    headers:
+      Authorization: "Bearer {{ ocp_token.stdout }}"
+    method: GET
+    validate_certs: no
+    status_code:
+      - 200
+      - 404
+  register: slave_present 
+  delegate_to: 127.0.0.1
+
+- debug: var=slave_present
+
+- set_fact:
+    groovy: |
+      import hudson.model.*
+      import jenkins.model.*
+      import hudson.slaves.*
+      import hudson.slaves.EnvironmentVariablesNodeProperty.Entry
+
+      Slave dumb = new DumbSlave("{{ inventory_hostname }}",
+                               "C:\\",
+                               new hudson.slaves.JNLPLauncher("{{ ocp_m }}:{{ ocp_np.stdout }}", null))
+      Jenkins.instance.addNode(dumb)
+      println("Created Jenkins Agent {{ inventory_hostname }} ")
+
+- debug: var=groovy
+
+- name: Add Windows Slave
+  uri:
+    url: "https://{{ ocp_route.stdout }}/scriptText"
+    method: POST
+    body_format: form-urlencoded
+    body: "script={{ groovy | urlencode }}"
+    headers:
+      Authorization: "Bearer {{ ocp_token.stdout }}"
+    validate_certs: no
+    return_content: yes
+    status_code:
+      - 200
+  register: slave_add
+  delegate_to: 127.0.0.1
+
+- debug: var=slave_add
+
+- name: Retrieve Slave Secret
+  uri:
+    url: "https://{{ ocp_route.stdout }}/scriptText"
+    method: POST
+    body_format: form-urlencoded
+    body: |
+      script=println jenkins.model.Jenkins.instance.nodesObject.getNode('{{ inventory_hostname }}')?.computer?.jnlpMac
+    headers:
+      Authorization: "Bearer {{ ocp_token.stdout }}"
+    validate_certs: no
+    return_content: yes
+    status_code:
+      - 200
+      - 404
+  register: slave_secret
+  delegate_to: 127.0.0.1
+
+- debug: var=slave_secret
+
+- name: Download the jenkins agent jar
+  win_get_url:
+    url: "https://{{ ocp_route.stdout }}/jnlpJars/agent.jar"
+    dest: "C:/agent.jar"
+    validate_certs: no
+
+- name: Create Jenkins agent
+  win_shell:  |
+    #Start-Process javaw -ArgumentList '-jar', 'C:\agent.jar', '-jnlpUrl', 'https://{{ ocp_route.stdout }}/computer/{{ inventory_hostname }}/slave-agent.jnlp', '-noCertificateCheck', '-secret', '{{ slave_secret.content | trim }}'
+     #Start-Job -ScriptBlock {
+     java -jar agent.jar -jnlpUrl https://{{ ocp_route.stdout }}/computer/{{ inventory_hostname }}/slave-agent.jnlp -noCertificateCheck -secret {{ slave_secret.content | trim }}
+     #}
+  args:
+    chdir: C:\
+
+  

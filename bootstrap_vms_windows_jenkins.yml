@@ -1,0 +1,183 @@
+---
+- name: Create ESXi Guest
+  hosts: localhost
+  connection: local
+  vars:
+    ocp_master_api: "r1.gxr.me"
+    ocp_project: "jenkins-ewiggin"
+    vm_windows_template: "wintemplate.gxr.me"
+    esxi_username: "{{ vc_username }}"
+    esxi_password: "{{ vc_password }}"
+    esxi_net: "VM Network"
+    esxi_hostname: "vcsa.gxr.me"
+    esxi_target_hostname: "esx2.gxr.me"
+    esxi_datacenter: "GXR"
+    disk_config:
+      - size_gb: '60'
+        type: 'thin'
+        datastore: 'esx2_vms_nvme'
+    mem_config: 4096
+    cpu_config: 1
+    vmstate: 'poweredon'
+
+  pre_tasks:
+
+    - name: Expose Jenkins JNLP Service via NodePort
+      shell: |
+                oc expose svc jenkins-jnlp --type=NodePort --generator="service/v2" --name=jenkins-jnlp-np -n {{ ocp_project }}
+      delegate_to: "{{ ocp_master_api }}"
+      ignore_errors: true
+      remote_user: root
+
+    - name: Obtain assigned Jenkins JNLP NodePort
+      shell: |
+        oc describe svc jenkins-jnlp-np -n {{ ocp_project }} | grep NodePort | grep TCP | awk '{print $3}' | cut -d '/' -f 1
+      delegate_to: "{{ ocp_master_api }}"
+      register: nodePort
+      ignore_errors: true
+      remote_user: root
+
+    - name: Allow Jenkins ServiceAccount Administrative Access for ScriptText
+      shell: |
+        oc policy add-role-to-user admin system:serviceaccount:{{ ocp_project }}:jenkins -n {{ ocp_project }}
+        # New rollout sometimes required: oc rollout latest dc/jenkins -n {{ ocp_project }}
+      delegate_to: "{{ ocp_master_api }}"
+      ignore_errors: true
+      remote_user: root
+
+    - name: Obtain self-signed certificate from OpenShift
+      shell: |
+        openssl s_client -connect jenkins-jenkins-ewiggin.apps.r1.gxr.me:443 -showcerts </dev/null 2>/dev/null|openssl x509 -outform PEM > /tmp/ocp.crt
+      delegate_to: 127.0.0.1
+
+    - debug:
+        msg: "{{ nodePort.stdout }}"
+
+    - name: Add host to dynamic inventory
+      add_host:
+        name: "{{ extras_hostname }}"
+        groups: jenkins
+        disks: "{{ disk_config }}"
+        memory: "{{ mem_config }}"
+        cpu: "{{ cpu_config }}"
+        ansible_connection: winrm
+        ansible_user: Administrator
+        ansible_password: "{{ esxi_password }}"
+        ansible_winrm_server_cert_validation: ignore
+
+  tasks:
+
+    - name: Provision VMware Instances
+      vmware_guest:
+        validate_certs: no
+        hostname: "{{ esxi_hostname }}"
+        username: "{{ esxi_username }}"
+        password: "{{ esxi_password }}"
+        esxi_hostname: "{{ esxi_target_hostname | default(esxi_hostname) }}"
+        datacenter: "{{ esxi_datacenter | default('ha-datacenter') }}"
+        name: "{{ item }}"
+        folder: "/{{ esxi_datacenter | default('ha-datacenter') }}/{{ esxi_folder | default('vm') }}"
+        disk: 
+        - "{{ hostvars[item]['disks'] | first }}"
+        template: "{{ vm_windows_template }}"
+        networks:
+        - device_type: e1000e
+          name: "{{ esxi_net | default('VM Dedicated Net') }}"
+          start_connected: true
+          type: dhcp
+        hardware:
+          memory_mb: "{{ hostvars[item]['memory'] | default('2048') }}"
+          num_cpus: "{{ hostvars[item]['cpu'] | default('1') }}"
+          scsi: paravirtual
+          hotadd_memory: True
+        state: "{{ vmstate | default('poweredon') }}"
+        force: yes
+        wait_for_ip_address: True
+        customization:
+          password: "{{ esxi_password }}"
+          runonce:
+          - powershell.exe -ExecutionPolicy Unrestricted -File C:\Windows\Temp\ConfigureRemotingForAnsible.ps1 -ForceNewSSLCert -EnableCredSSP
+      register: vms
+      loop: "{{ groups['jenkins'] }}"
+      tags:
+        - provision
+        - cleanup
+
+    - name: Wait for host WinRM to be ready
+      wait_for:
+        host: "{{ item }}"
+        port: 5986
+        timeout: 900
+      connection: local
+      loop: "{{ groups['jenkins'] }}"
+      when: vmstate != 'absent'
+      tags:
+        - provision
+
+- name: Configure Windows ESXi Guest
+  hosts: jenkins
+  gather_facts: no
+  vars:
+    ocp_master_api: "r1.gxr.me"
+    ocp_project: "jenkins-ewiggin"
+    vmstate: 'poweredon'
+    jenkins_jar: /tmp/jenkins-cli.jar
+    jenkins_plugins:
+      - git
+      - log-parser
+      - kubernetes
+      - copyartifact
+      - workflow-aggregator
+      - workflow-multibranch
+      - template-project
+
+#  pre_tasks:
+#    - name: Copy OpenShift Router Certificate
+#      win_copy:
+#        src: /tmp/ocp.crt
+#        dest: C:\ocp.crt
+#
+#    - name: Import OpenShift Router Certificate 
+#      win_certificate_store:
+#        path: C:\ocp.crt
+#        state: present
+#        store_location: LocalMachine
+#        store_name: CertificateAuthority
+#
+#    - name: Get Jenkins route
+#      shell: "oc get route jenkins {% raw %}--template='{{ .spec.host }}'{% endraw %} -n {{ ocp_project }}"
+#      register: ocp_route_pre
+#      delegate_to: "{{ ocp_master_api }}"
+#
+#    - name: Set JAVA_HOME on Windows Slave
+#      set_fact:
+#        jh: 'C:\Program Files (x86)\Java\jre1.8.0_191'
+#
+#    - name: Import Test
+#      java_cert:
+#        cert_url: "{{ ocp_route_pre.stdout }}"
+#        cert_port: 443
+#        keystore_path: '{{ jh }}\lib\security\cacerts'
+#        keystore_pass: changeit
+#        executable: '{{ jh }}\bin\keytool.exe'
+#        state: present
+#      ignore_errors: yes
+#
+#    - name: Import OpenShift Router Certificate to Java Keystore
+#      win_shell: |
+#        '{{ jh }}\bin\keytool.exe' -printcert -sslserver {{ ocp_route_pre.stdout }}:443 -rfc | '{{ jh }}\bin\\keytool.exe' -import -noprompt -alias ocp -keystore '{{ jh }}\lib\security\cacerts' -storepass changeit
+#      args:
+#        executable: cmd
+
+  roles:
+    - role: deekayen.chocolatey
+      when: vmstate != 'absent'
+
+  post_tasks:
+    - name: Include Jenkins node configuration when vmstate is present
+      include_tasks: tasks_conf_windows_jenkins.yml
+      vars:
+        ocp_p: "{{ ocp_project }}"
+        ocp_m: "{{ ocp_master_api }}"
+      when: vmstate != 'absent'
+    
