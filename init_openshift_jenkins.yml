@@ -1,0 +1,50 @@
+---
+- name: Create OpenShift Jenkins Environment
+  hosts: localhost
+  connection: local
+  vars:
+    bb_uri: http://lab.gxr.me:7990
+    bb_user: johnsmith
+    bb_useremail: liveaverage@gmail.com
+    bb_project: "Jenkins-Pipeline-{{ bb_user }}"
+    requestor: "{{ bb_user }}"
+    requestor_name: "John Smith"
+    oc_master: r1.gxr.me
+  roles:
+    - ansible-init-openshift-jenkins
+
+#- import_playbook: bootstrap_vms_windows_jenkins.yml extras_hostname="jnk-{{ bb_user[:11] }}.gxr.me"
+#  when: enable_windows_slave == 'Yes'
+
+- name: Create OpenShift Jenkins Environment
+  hosts: localhost
+  connection: local
+  vars:
+    bb_uri: http://lab.gxr.me:7990
+    bb_user: johnsmith
+    bb_useremail: liveaverage@gmail.com
+    bb_project: "Jenkins-Pipeline-{{ bb_user }}"
+    requestor: "{{ bb_user }}"
+    requestor_name: "John Smith"
+    oc_master: r1.gxr.me
+  tasks:
+    - name: Notify User via Email
+      mail:
+        host: 127.0.0.1
+        to: "{{ bb_useremail }}"
+        from: "liveaverage@gmail.com (Ansible Automation)"
+        subject: "Your Automation Request is Complete: OpenShift Jenkins Pipeline"
+        body: |
+          The details of your request can be found below:
+
+            OpenShift Login:            https://{{ oc_master }}:8443
+            OpenShift Project Name:     jenkins-{{ bb_user }}
+            OpenShift Project Display:  Jenkins Pipeline {{ bb_user }}
+
+            {% if enable_windows_slave == 'Yes' %}
+            Jenkins Windows Slave: jnk-{{ bb_user[:11] }}.gxr.me
+            {% endif %}
+
+- import_playbook: bootstrap_vms_windows_jenkins.yml extras_hostname="jnk-{{ bb_user[:11] }}.gxr.me"
+  when: enable_windows_slave == 'Yes'
+

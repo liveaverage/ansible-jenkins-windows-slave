@@ -1,0 +1,168 @@
+---
+- name: Create Bitbucket Environment
+  hosts: localhost
+  connection: local
+  vars:
+    bb_uri: http://lab.gxr.me:7990
+    bb_user: johnsmith
+    bb_useremail: liveaverage@gmail.com
+    bb_project: "Jenkins-Pipeline-{{ bb_user }}"
+  tasks:
+    - name: Create Bitbucket User
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/admin/users?name={{ bb_user }}&password=2018&displayName={{ bb_user }}&emailAddress={{ bb_useremail }}&addToDefualtGroup=true&notify=false"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: POST
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        status_code:
+          - 204
+          - 409
+      register: rcu
+      changed_when: rcu.status == 204
+
+    - name: Create Bitbucket Group
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/admin/groups?name={{ bb_project }}"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: POST
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        status_code:
+          - 200
+          - 409
+      register: rcg
+      changed_when: rcg.status == 200
+
+    - name: Add user to group
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/admin/users/add-groups"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: POST
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body: |
+          {
+           "user": "{{ bb_user }}",
+           "groups": [
+               "{{ bb_project }}"
+           ]
+          }
+        status_code:
+          - 200
+      register: rcag
+      changed_when: rcag.status == 200
+
+
+    - name: Create Bitbucket Project
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/projects"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: POST
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body: |
+          {
+           "key": "{{ bb_user[:5] | upper }}",
+           "name": "Jenkins-{{ bb_user }}",
+           "description": "Automatically provisioned Jenkins project for {{ bb_user }}",
+           "public": true
+          }
+        status_code:
+          - 201
+          - 409
+      register: rcp
+      changed_when: rcp.status == 201
+
+    - name: Add Group to Bitbucket Project
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/projects/{{ bb_user[:5] | upper }}/permissions/groups?permission=PROJECT_ADMIN&name={{ bb_project }}"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: PUT
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        status_code:
+          - 204
+      register: rcp
+      changed_when: rcp.status == 204
+
+
+    - name: Create Bitbucket Repo
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/projects/{{ bb_user[:5] | upper }}/repos"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: POST
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body: |
+          {
+           "name": "{{ bb_project }}",
+           "scmId": "git",
+           "forkable": true,
+           "public": true
+          }
+        status_code:
+          - 201
+          - 409
+      register: rcr
+      changed_when: rcr.status == 201
+
+    - name: Get Bitbucket Repo details
+      uri:
+        url: "{{ bb_uri }}/rest/api/1.0/projects/{{ bb_user[:5] | upper }}/repos/{{ bb_project }}"
+        user: administrator
+        password: "{{ vc_password }}"
+        method: GET
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+        body_format: json
+        body: |
+          {
+           "name": "{{ bb_project }}",
+           "scmId": "git",
+           "forkable": true,
+           "public": true
+          }
+        status_code:
+          - 200
+      register: repoget
+      changed_when: False
+
+
+    - debug: var=repoget
+    - name: Display HTTP Clone URL
+      debug: 
+        msg: "{{ repoget | json_query('json.links.clone[?name==`http`].href') | join (', ') }}"
+
+    - name: Notify User via Email
+      mail:
+        host: 127.0.0.1
+        to: "{{ bb_useremail }}"
+        from: "liveaverage@gmail.com (Ansible Automation)"
+        subject: "Your Automation Request is Complete: Bitbucket Project, Repo"
+        body: |
+          The details of your request can be found below:
+          
+            Bitbucket Project:     Jenkins-{{ bb_user }} 
+            Bitcuket Project Key:  {{ bb_user[:5] | upper }}
+            Bitbucket Repo:        {{ bb_project }}
+
+          You can push your code to the following location(s):
+
+            {{ repoget | json_query('json.links.clone[?name==`http`].href') | join (', ') }}
